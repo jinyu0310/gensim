@@ -60,7 +60,9 @@ logger = logging.getLogger(__name__)
 try:
     from gensim.models.doc2vec_inner import train_document_dbow, train_document_dm, train_document_dm_concat
     from gensim.models.word2vec_inner import FAST_VERSION  # blas-adaptation shared from word2vec
-except:
+    logger.debug('Fast version of {0} is being used'.format(__name__))
+except ImportError:
+    logger.warning('Slow version of {0} is being used'.format(__name__))
     # failed... fall back to plain numpy (20-80x slower training than the above)
     FAST_VERSION = -1
 
@@ -128,7 +130,7 @@ except:
 
         """
         if word_vectors is None:
-            word_vectors = model.syn0
+            word_vectors = model.wv.syn0
         if word_locks is None:
             word_locks = model.syn0_lockf
         if doctag_vectors is None:
@@ -136,8 +138,8 @@ except:
         if doctag_locks is None:
             doctag_locks = model.docvecs.doctag_syn0_lockf
 
-        word_vocabs = [model.vocab[w] for w in doc_words if w in model.vocab and
-                       model.vocab[w].sample_int > model.random.rand() * 2**32]
+        word_vocabs = [model.wv.vocab[w] for w in doc_words if w in model.wv.vocab and
+                       model.wv.vocab[w].sample_int > model.random.rand() * 2**32]
 
         for pos, word in enumerate(word_vocabs):
             reduced_window = model.random.randint(model.window)  # `b` in the original doc2vec code
@@ -183,7 +185,7 @@ except:
 
         """
         if word_vectors is None:
-            word_vectors = model.syn0
+            word_vectors = model.wv.syn0
         if word_locks is None:
             word_locks = model.syn0_lockf
         if doctag_vectors is None:
@@ -191,13 +193,13 @@ except:
         if doctag_locks is None:
             doctag_locks = model.docvecs.doctag_syn0_lockf
 
-        word_vocabs = [model.vocab[w] for w in doc_words if w in model.vocab and
-                       model.vocab[w].sample_int > model.random.rand() * 2**32]
+        word_vocabs = [model.wv.vocab[w] for w in doc_words if w in model.wv.vocab and
+                       model.wv.vocab[w].sample_int > model.random.rand() * 2**32]
         doctag_len = len(doctag_indexes)
         if doctag_len != model.dm_tag_count:
             return 0  # skip doc without expected number of doctag(s) (TODO: warn/pad?)
 
-        null_word = model.vocab['\0']
+        null_word = model.wv.vocab['\0']
         pre_pad_count = model.window
         post_pad_count = model.window
         padded_document_indexes = (
@@ -212,7 +214,7 @@ except:
                 + padded_document_indexes[(pos + 1):(pos + 1 + post_pad_count)]  # following words
             )
             word_context_len = len(word_context_indexes)
-            predict_word = model.vocab[model.index2word[padded_document_indexes[pos]]]
+            predict_word = model.wv.vocab[model.wv.index2word[padded_document_indexes[pos]]]
             # numpy advanced-indexing copies; concatenate, flatten to 1d
             l1 = concatenate((doctag_vectors[doctag_indexes], word_vectors[word_context_indexes])).ravel()
             neu1e = train_cbow_pair(model, predict_word, None, l1, alpha,
@@ -405,7 +407,7 @@ class DocvecsArray(utils.SaveLoad):
                     self.doctag_syn0norm = empty(self.doctag_syn0.shape, dtype=REAL)
                 np_divide(self.doctag_syn0, sqrt((self.doctag_syn0 ** 2).sum(-1))[..., newaxis], self.doctag_syn0norm)
 
-    def most_similar(self, positive=[], negative=[], topn=10, clip_start=0, clip_end=None):
+    def most_similar(self, positive=[], negative=[], topn=10, clip_start=0, clip_end=None, indexer=None):
         """
         Find the top-N most similar docvecs known from training. Positive docs contribute
         positively towards the similarity, negative docs negatively.
@@ -450,12 +452,15 @@ class DocvecsArray(utils.SaveLoad):
             raise ValueError("cannot compute similarity with no input")
         mean = matutils.unitvec(array(mean).mean(axis=0)).astype(REAL)
 
+        if indexer is not None:
+            return indexer.most_similar(mean, topn)
+
         dists = dot(self.doctag_syn0norm[clip_start:clip_end], mean)
         if not topn:
             return dists
         best = matutils.argsort(dists, topn=topn + len(all_docs), reverse=True)
         # ignore (don't return) docs from the input
-        result = [(self.index_to_doctag(sim), float(dists[sim])) for sim in best if sim not in all_docs]
+        result = [(self.index_to_doctag(sim + clip_start), float(dists[sim])) for sim in best if (sim + clip_start) not in all_docs]
         return result[:topn]
 
     def doesnt_match(self, docs):
@@ -503,8 +508,8 @@ class DocvecsArray(utils.SaveLoad):
         d1 = model.infer_vector(doc_words=doc_words1, alpha=alpha, min_alpha=min_alpha, steps=steps)
         d2 = model.infer_vector(doc_words=doc_words2, alpha=alpha, min_alpha=min_alpha, steps=steps)
         return dot(matutils.unitvec(d1), matutils.unitvec(d2))
-        
-        
+
+
 class Doctag(namedtuple('Doctag', 'offset, word_count, doc_count')):
     """A string document tag discovered during the initial vocabulary
     scan. (The document-vector equivalent of a Vocab object.)
@@ -548,7 +553,7 @@ class Doc2Vec(Word2Vec):
 
         `alpha` is the initial learning rate (will linearly drop to zero as training progresses).
 
-        `seed` = for the random number generator. 
+        `seed` = for the random number generator.
         Note that for a fully deterministically-reproducible run, you must also limit the model to
         a single worker thread, to eliminate ordering jitter from OS thread scheduling. (In Python
         3, reproducibility between interpreter launches also requires use of the PYTHONHASHSEED
@@ -565,7 +570,7 @@ class Doc2Vec(Word2Vec):
 
         `workers` = use this many worker threads to train the model (=faster training with multicore machines).
 
-        `iter` = number of iterations (epochs) over the corpus. The default inherited from Word2Vec is 5, 
+        `iter` = number of iterations (epochs) over the corpus. The default inherited from Word2Vec is 5,
         but values of 10 or 20 are common in published 'Paragraph Vector' experiments.
 
         `hs` = if 1 (default), hierarchical sampling will be used for model training (else set to 0).
@@ -638,15 +643,21 @@ class Doc2Vec(Word2Vec):
         self.docvecs.borrow_from(other_model.docvecs)
         super(Doc2Vec, self).reset_from(other_model)
 
-    def scan_vocab(self, documents, progress_per=10000, trim_rule=None):
+    def scan_vocab(self, documents, progress_per=10000, trim_rule=None, update=False):
         logger.info("collecting all words and their counts")
         document_no = -1
         total_words = 0
         min_reduce = 1
         interval_start = default_timer() - 0.00001  # guard against next sample being identical
         interval_count = 0
+        checked_string_types = 0
         vocab = defaultdict(int)
         for document_no, document in enumerate(documents):
+            if not checked_string_types:
+                if isinstance(document.words, string_types):
+                    logger.warn("Each 'words' should be a list of words (usually unicode strings)."
+                                "First 'words' here is instead plain %s." % type(document.words))
+                checked_string_types += 1
             if document_no % progress_per == 0:
                 interval_rate = (total_words - interval_count) / (default_timer() - interval_start)
                 logger.info("PROGRESS: at example #%i, processed %i words (%i/s), %i word types, %i tags",
@@ -767,6 +778,19 @@ class Doc2Vec(Word2Vec):
             segments.append('t%d' % self.workers)
         return '%s(%s)' % (self.__class__.__name__, ','.join(segments))
 
+    def delete_temporary_training_data(self, keep_doctags_vectors=True, keep_inference=True):
+        """
+        Discard parameters that are used in training and score. Use if you're sure you're done training a model.
+        Set `keep_doctags_vectors` to False if you don't want to save doctags vectors,
+        in this case you can't to use docvecs's most_similar, similarity etc. methods.
+        Set `keep_inference` to False if you don't want to store parameters that is used for infer_vector method
+        """
+        if not keep_inference:
+            self._minimize_model(False, False, False)
+        if self.docvecs and hasattr(self.docvecs, 'doctag_syn0') and not keep_doctags_vectors:
+            del self.docvecs.doctag_syn0
+        if self.docvecs and hasattr(self.docvecs, 'doctag_syn0_lockf'):
+            del self.docvecs.doctag_syn0_lockf
 
 class TaggedBrownCorpus(object):
     """Iterate over documents from the Brown corpus (part of NLTK data), yielding
